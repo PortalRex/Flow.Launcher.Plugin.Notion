@@ -30,6 +30,12 @@
 - All data is cached and stored locally for optimal performance
 - Prioritizing user privacy and security
 
+## Notion API Compatibility
+
+- The plugin now targets Notion API version `2025-09-03`.
+- Notion introduces **data sources** for synced databases. The plugin automatically migrates existing cache files and relation settings, but every integration token must be re-shared with the desired pages or data sources inside Notion.
+- When you update your token, share at least one page or database with that integration. Without sharing, Notion will return `401 API token is invalid`.
+
 # Commands
 
 - `@` To select database
@@ -104,6 +110,22 @@
 > **Note:**
 > 
 > To enhance the visual appeal and facilitate the display of SVG icons in Flow Launcher, I recommend installing the SVG Explorer Extension for SVG preview. You can find the extension [here](https://github.com/tibold/svg-explorer-extension/releases).
+
+## Development & Builds
+
+- Install the [.NET 7 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/7.0).
+- Restore and publish the plugin from the repo root:
+
+  ```powershell
+  dotnet publish src/Flow.Launcher.Plugin.Notion.csproj -c Release
+  ```
+
+- The packaged plugin resides in `src/bin/Release/net7.0-windows/publish/`. Copy those contents into your Flow Launcher plugin directory (for example `%APPDATA%\FlowLauncher\Plugins\Notion`) or attach the folder when creating a release.
+
+### Releasing
+
+- Create or push a Git tag such as `v5.1.0`. The **Publish Release** workflow will build the plugin, zip the publish folder, and attach it to a GitHub Release automatically.
+- You can also run the workflow manually from the **Actions** tab using the `workflow_dispatch` option.
 
 # Demos
 
