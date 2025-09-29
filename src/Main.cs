@@ -89,16 +89,33 @@ namespace Flow.Launcher.Plugin.Notion
 
                         if (_settings.RelationDatabasesIds.Count != 0)
                         {
-                            foreach (string databaseId in _settings.RelationDatabasesIds)
+                            var normalizedRelationIds = _settings.RelationDatabasesIds
+                                .Select(NormalizeRelationId)
+                                .Where(id => !string.IsNullOrEmpty(id))
+                                .Distinct()
+                                .ToList();
+
+                            if (!normalizedRelationIds.SequenceEqual(_settings.RelationDatabasesIds))
                             {
+                                _settings.RelationDatabasesIds = normalizedRelationIds;
+                                if (normalizedRelationIds.Count > 0)
+                                {
+                                    _settings.RelationDatabaseId = normalizedRelationIds[0];
+                                }
+                            }
+
+                            foreach (string relationId in normalizedRelationIds)
+                            {
+                                string relationCachePath = Path.Combine(cacheDirectory, $"{relationId}.json");
                                 _ = Task.Run(async () =>
                                 {
-                                    await this._notionDataParser.QueryDB(databaseId, null, Path.Combine(cacheDirectory, $"{databaseId}.json"));
+                                    await this._notionDataParser.QueryDB(relationId, null, relationCachePath);
                                 });
                             }
-                            if (_settings.RelationDatabasesIds.Count > 0)
+
+                            if (normalizedRelationIds.Count > 0)
                             {
-                                ProjectsId = LoadJsonData(Path.Combine(cacheDirectory, $"{_settings.RelationDatabasesIds[0]}.json"));
+                                ProjectsId = LoadJsonData(Path.Combine(cacheDirectory, $"{normalizedRelationIds[0]}.json"));
                             }
                         }
                     }
@@ -108,7 +125,8 @@ namespace Flow.Launcher.Plugin.Notion
                     databaseId = LoadJsonData(DatabaseCachePath);
                     if (_settings.RelationDatabasesIds.Count > 0)
                     {
-                        ProjectsId = LoadJsonData(Path.Combine(cacheDirectory, $"{_settings.RelationDatabasesIds[0]}.json"));
+                        var normalizedRelationId = NormalizeRelationId(_settings.RelationDatabasesIds[0]);
+                        ProjectsId = LoadJsonData(Path.Combine(cacheDirectory, $"{normalizedRelationId}.json"));
                     }
                     Context.API.LogException(nameof(Main), "An error occurred while build database and relaiton cache", ex);
                 }
@@ -118,7 +136,8 @@ namespace Flow.Launcher.Plugin.Notion
                 databaseId = LoadJsonData(DatabaseCachePath);
                 if (_settings.RelationDatabasesIds.Count > 0)
                 {
-                    ProjectsId = LoadJsonData(Path.Combine(cacheDirectory, $"{_settings.RelationDatabasesIds[0]}.json"));
+                    var normalizedRelationId = NormalizeRelationId(_settings.RelationDatabasesIds[0]);
+                    ProjectsId = LoadJsonData(Path.Combine(cacheDirectory, $"{normalizedRelationId}.json"));
                 }
                 Context.API.LogWarn(nameof(Main), "No internet Connection for Init cache using last cached data", MethodBase.GetCurrentMethod().Name);
             }
@@ -295,7 +314,7 @@ namespace Flow.Launcher.Plugin.Notion
                                             }
                                             try
                                             {
-                                                databaseIdResponse = EditedObject["parent"]["database_id"].ToString();
+                                                databaseIdResponse = ExtractParentIdentifier(EditedObject["parent"]);
                                             }
                                             catch { }
 
@@ -3268,14 +3287,19 @@ namespace Flow.Launcher.Plugin.Notion
                 var data = data_return;
                 children = children_return;
 
-                using (HttpClient client = new HttpClient())
+                using (HttpClient client = NotionApiClientFactory.Create(_settings))
                 {
-                    client.DefaultRequestHeaders.Add("Authorization", "Bearer " + _settings.InernalInegrationToken);
-                    client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
 
                     string createUrl = "https://api.notion.com/v1/pages";
                     
-                    payload["parent"] = new Dictionary<string, object> { { "database_id", DATABASE_ID } };
+                    if (!string.IsNullOrEmpty(DATABASE_ID))
+                    {
+                        payload["parent"] = new Dictionary<string, object>
+                        {
+                            { "type", "data_source_id" },
+                            { "data_source_id", DATABASE_ID }
+                        };
+                    }
                     payload["properties"] = data;
 
                     if (children != null)
@@ -3431,6 +3455,65 @@ namespace Flow.Launcher.Plugin.Notion
             }
         }
 
+        private static string ExtractParentIdentifier(JToken parentToken)
+        {
+            if (parentToken == null)
+            {
+                return string.Empty;
+            }
+
+            var typeValue = parentToken["type"]?.ToString();
+            if (!string.IsNullOrEmpty(typeValue) && parentToken[typeValue] != null)
+            {
+                return parentToken[typeValue]!.ToString();
+            }
+
+            if (parentToken["database_id"] != null)
+            {
+                return parentToken["database_id"]!.ToString();
+            }
+
+            if (parentToken["data_source_id"] != null)
+            {
+                return parentToken["data_source_id"]!.ToString();
+            }
+
+            return string.Empty;
+        }
+
+        private static string NormalizeRelationId(string relationId)
+        {
+            if (string.IsNullOrEmpty(relationId))
+            {
+                return relationId;
+            }
+
+            foreach (var kv in databaseId)
+            {
+                try
+                {
+                    var element = kv.Value;
+                    if (element.GetProperty("id").GetString() == relationId)
+                    {
+                        return relationId;
+                    }
+
+                    if (element.TryGetProperty("legacy_database_id", out JsonElement legacyElement) &&
+                        legacyElement.ValueKind == JsonValueKind.String &&
+                        string.Equals(legacyElement.GetString(), relationId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return element.GetProperty("id").GetString();
+                    }
+                }
+                catch
+                {
+                    // ignore malformed cache entries
+                }
+            }
+
+            return relationId;
+        }
+
         async Task<HttpResponseMessage> EditPageMainProperty(bool open, string pageId, Dictionary<string, object> filteredQueryEditing, List<string> fromContext = null, bool retryFailedRequest = false, string datePropName = null, string urlPropName = null, Dictionary<int, string> relationPropName = null, string mainPayload = null, string childPayload = null)
         {
             Dictionary<string, object> payload = new Dictionary<string, object>();
@@ -3444,12 +3527,10 @@ namespace Flow.Launcher.Plugin.Notion
                 }
 
                 var (data, children, DatabaseId) = FormatData(filteredQueryEditing, Mode: "Edit", DbNameInCache: searchResults[pageId][2].GetString(), pageId:pageId);
-                using (HttpClient client = new HttpClient())
+                using (HttpClient client = NotionApiClientFactory.Create(_settings))
                 {
                     HttpResponseMessage response = null;
                     string EditUrl;
-                    client.DefaultRequestHeaders.Add("Authorization", "Bearer " + _settings.InernalInegrationToken);
-                    client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
 
                     if (children != null || (retryFailedRequest && !string.IsNullOrEmpty(childPayload)))
                     {
@@ -3625,12 +3706,10 @@ namespace Flow.Launcher.Plugin.Notion
             {
                 payload = _notionDataParser.ConvertVariables(payload);
 
-                using (HttpClient client = new HttpClient())
+                using (HttpClient client = NotionApiClientFactory.Create(_settings))
                 {
                     StringContent Payload = new StringContent(JsonConvert.SerializeObject(JsonConvert.DeserializeObject<dynamic>(payload)), Encoding.UTF8, "application/json");
                     string delete_url = $"https://api.notion.com/v1/pages/{PageId}";
-                    client.DefaultRequestHeaders.Add("Authorization", "Bearer " + _settings.InernalInegrationToken);
-                    client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
                     response = await client.PatchAsync(delete_url, Payload);
                     return response;
                 }

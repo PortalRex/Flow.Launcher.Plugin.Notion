@@ -31,10 +31,26 @@ namespace Flow.Launcher.Plugin.Notion
             {
                 try
                 {
-                    return Main.databaseId.ToDictionary(
-                                        kv => kv.Value.GetProperty("id").GetString(),
-                                        kv => kv.Key
-                                    );
+                    var map = new Dictionary<string, string>();
+                    foreach (var kv in Main.databaseId)
+                    {
+                        string? dataSourceId = kv.Value.GetProperty("id").GetString();
+                        if (!string.IsNullOrEmpty(dataSourceId))
+                        {
+                            map[dataSourceId] = kv.Key;
+                        }
+
+                        if (kv.Value.TryGetProperty("legacy_database_id", out JsonElement legacyElement))
+                        {
+                            string? legacyId = legacyElement.ValueKind == JsonValueKind.String ? legacyElement.GetString() : null;
+                            if (!string.IsNullOrEmpty(legacyId) && !map.ContainsKey(legacyId))
+                            {
+                                map[legacyId] = kv.Key;
+                            }
+                        }
+                    }
+
+                    return map;
                 }
                 catch
                 {
@@ -54,6 +70,97 @@ namespace Flow.Launcher.Plugin.Notion
             this._settings = settings;
             UpdateProjectsMap();
             _iconPath = Path.Combine("Icons", "icons");
+        }
+
+        private static JObject? NormalizeSearchResult(JToken result)
+        {
+            if (result is not JObject obj)
+            {
+                return null;
+            }
+
+            if (obj.TryGetValue("properties", out _))
+            {
+                return obj;
+            }
+
+            foreach (string candidateKey in new[] { "data_source", "database" })
+            {
+                if (obj.TryGetValue(candidateKey, out JToken? nestedToken) && nestedToken is JObject nested && nested.TryGetValue("properties", out _))
+                {
+                    JObject merged = (JObject)nested.DeepClone();
+
+                    foreach (JProperty property in obj.Properties())
+                    {
+                        if (!merged.ContainsKey(property.Name))
+                        {
+                            merged[property.Name] = property.Value;
+                        }
+                    }
+
+                    return merged;
+                }
+            }
+
+            return obj;
+        }
+
+        private static string? ExtractParentIdentifier(JObject container)
+        {
+            if (container.TryGetValue("parent", out JToken? parentToken) && parentToken is JObject parentObj)
+            {
+                var typeValue = parentObj["type"]?.ToString();
+                if (!string.IsNullOrEmpty(typeValue) && parentObj[typeValue] != null)
+                {
+                    return parentObj[typeValue]?.ToString();
+                }
+
+                if (parentObj["database_id"] != null)
+                {
+                    return parentObj["database_id"]?.ToString();
+                }
+
+                if (parentObj["data_source_id"] != null)
+                {
+                    return parentObj["data_source_id"]?.ToString();
+                }
+            }
+
+            if (container.TryGetValue("database_parent", out JToken? dbParentToken) && dbParentToken is JObject dbParentObj)
+            {
+                var typeValue = dbParentObj["type"]?.ToString();
+                if (!string.IsNullOrEmpty(typeValue) && dbParentObj[typeValue] != null)
+                {
+                    return dbParentObj[typeValue]?.ToString();
+                }
+
+                if (dbParentObj["database_id"] != null)
+                {
+                    return dbParentObj["database_id"]?.ToString();
+                }
+
+                if (dbParentObj["data_source_id"] != null)
+                {
+                    return dbParentObj["data_source_id"]?.ToString();
+                }
+            }
+
+            return null;
+        }
+
+        private static string? ExtractRelationTargetId(JObject relationObject)
+        {
+            if (relationObject["data_source_id"] != null)
+            {
+                return relationObject["data_source_id"]?.ToString();
+            }
+
+            if (relationObject["database_id"] != null)
+            {
+                return relationObject["database_id"]?.ToString();
+            }
+
+            return null;
         }
 
         void UpdateProjectsMap()
@@ -169,12 +276,18 @@ namespace Flow.Launcher.Plugin.Notion
 
         private HttpClient CreateHttpClient()
         {
-            var client = new HttpClient();
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _settings.InernalInegrationToken.Trim());
-            client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
-            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        
-            return client;
+            try
+            {
+                var token = _settings.InernalInegrationToken?.Trim() ?? string.Empty;
+                var preview = token.Length <= 6 ? token : token.Substring(0, 6);
+                _context.API.LogInfo(nameof(NotionDataParser), $"Creating HttpClient with token preview '{preview}' (length {token.Length}).");
+            }
+            catch
+            {
+                // best effort diagnostic; ignore logging failures
+            }
+
+            return NotionApiClientFactory.Create(_settings);
         }
 
         internal async Task<JArray> CallApiForSearch(OrderedDictionary oldDatabaseId = null, string startCursor = null, string keyword = "", int numPage = 10, bool Force = false, string Value = "page")
@@ -186,12 +299,18 @@ namespace Flow.Launcher.Plugin.Notion
                 numPage = 100;
             }
 
+            string filterValue = Value;
+            if (string.Equals(filterValue, "database", StringComparison.OrdinalIgnoreCase))
+            {
+                filterValue = "data_source";
+            }
+
             Dictionary<string, object> data = new Dictionary<string, object>
             {
                 { "query", keyword },
                 { "filter", new Dictionary<string, object>
                     {
-                        { "value", Value},
+                        { "value", filterValue},
                         { "property", "object" }
                     }
                 },
@@ -231,7 +350,16 @@ namespace Flow.Launcher.Plugin.Notion
                         allResults.Merge(jsonObject["results"]);
                     }
 
-                    if (Value.Contains("database")) return allResults;
+                    if (Value.Contains("database"))
+                    {
+                        var normalizedResults = new JArray();
+                        foreach (var result in allResults)
+                        {
+                            normalizedResults.Add(NormalizeSearchResult(result) ?? result);
+                        }
+
+                        return normalizedResults;
+                    }
 
                     if (allResults.Count != 1 || Force)
                     {
@@ -240,13 +368,19 @@ namespace Flow.Launcher.Plugin.Notion
                         {
                             try
                             {
-                                JObject properties = (JObject)result["properties"];
+                                JObject? normalizedResult = NormalizeSearchResult(result);
+                                if (normalizedResult is null || !normalizedResult.TryGetValue("properties", out JToken? props))
+                                {
+                                    continue;
+                                }
+
+                                JObject properties = (JObject)props;
                                 string title = null;
                                 string icon = _context.CurrentPluginMetadata.IcoPath;
 
                                 if (_settings.PagesIcons)
                                 {
-                                    icon = IconParse(result["icon"]);
+                                    icon = IconParse(normalizedResult["icon"]);
 
                                 }
 
@@ -264,7 +398,7 @@ namespace Flow.Launcher.Plugin.Notion
                                 string extractedTitle;
                                 try
                                 {
-                                    extractedTitle = GetFullTitle(result["properties"][title]["title"]);
+                                    extractedTitle = GetFullTitle(normalizedResult["properties"][title]["title"]);
                                 }
                                 catch (ArgumentOutOfRangeException)
                                 {
@@ -275,7 +409,15 @@ namespace Flow.Launcher.Plugin.Notion
 
                                 try
                                 {
-                                    DBName = databaseIdForName[result["parent"]["database_id"].ToString()];
+                                    string? parentId = ExtractParentIdentifier(normalizedResult);
+                                    if (!string.IsNullOrEmpty(parentId) && databaseIdForName.TryGetValue(parentId, out string? dbNameValue))
+                                    {
+                                        DBName = dbNameValue;
+                                    }
+                                    else
+                                    {
+                                        DBName = string.Empty;
+                                    }
                                 }
                                 catch
                                 {
@@ -284,13 +426,13 @@ namespace Flow.Launcher.Plugin.Notion
 
                                 try
                                 {
-                                    if (result["parent"]["type"].ToString() == "block_id")
+                                    if (normalizedResult["parent"]["type"].ToString() == "block_id")
                                     {
-                                        var page_id = GetPageIdByBlock(result["parent"]["block_id"].ToString());
+                                        var page_id = GetPageIdByBlock(normalizedResult["parent"]["block_id"].ToString());
                                         Chain = page_id;
                                     }
-                                    else if (result["parent"]["type"].ToString() == "page_id")
-                                        Chain = result["parent"]["page_id"].ToString();
+                                    else if (normalizedResult["parent"]["type"].ToString() == "page_id")
+                                        Chain = normalizedResult["parent"]["page_id"].ToString();
 
                                 }
                                 catch (Exception ex)
@@ -301,7 +443,7 @@ namespace Flow.Launcher.Plugin.Notion
                                 }
 
 
-                                string idPage = result.Value<string>("id");
+                                string idPage = normalizedResult.Value<string>("id");
 
                                 // Try to Extract the Relation Value from the response if it's exist
                                 string relatedProject;
@@ -309,7 +451,7 @@ namespace Flow.Launcher.Plugin.Notion
                                 {
                                     var TargetDatabaseMap = Main.databaseId[DBName];
                                     // var projectRelation = result["properties"][TargetDatabaseMap.GetProperty("relation").EnumerateArray().First().GetString()]["relation"][0];
-                                    var projectRelation = result["properties"][TargetDatabaseMap.GetProperty("relation").EnumerateObject().FirstOrDefault(x => x.Value.GetString() == _settings.RelationDatabasesIds[0]).Name]["relation"][0];
+                                    var projectRelation = normalizedResult["properties"][TargetDatabaseMap.GetProperty("relation").EnumerateObject().FirstOrDefault(x => x.Value.GetString() == _settings.RelationDatabasesIds[0]).Name]["relation"][0];
                                     if (projectRelation != null && projectRelation["id"] != null)
                                     {
                                         relatedProject = projectIdForName[projectRelation["id"].ToString()];
@@ -370,7 +512,7 @@ namespace Flow.Launcher.Plugin.Notion
                 }
                 else
                 {
-                    _context.API.LogWarn(nameof(NotionDataParser), response.ReasonPhrase + "\n"  + response.Content.ReadAsStringAsync().Result + " \n (" + _settings.InernalInegrationToken + ")", MethodBase.GetCurrentMethod().Name);
+                    _context.API.LogWarn(nameof(NotionDataParser), response.ReasonPhrase + "\n"  + response.Content.ReadAsStringAsync().Result + $"\nToken preview: {_settings.InernalInegrationToken?.Trim()?.Substring(0, Math.Min(6, _settings.InernalInegrationToken?.Length ?? 0))}", MethodBase.GetCurrentMethod().Name);
                     // Try To recache the whole shared pages in case of page deleted on notion by Notion UI
                     if (!string.IsNullOrEmpty(startCursor))
                         await CallApiForSearch(oldDatabaseId: null, startCursor: null, numPage: 100);
@@ -381,10 +523,8 @@ namespace Flow.Launcher.Plugin.Notion
 
         public JObject RetrievePageProperitesById(string pageId)
         {
-            using (HttpClient client = new HttpClient())
+            using (HttpClient client = NotionApiClientFactory.Create(_settings))
             {
-                client.DefaultRequestHeaders.Add("Authorization", "Bearer " + _settings.InernalInegrationToken);
-                client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
                 string url = "https://api.notion.com/v1/pages/";
                 var response = client.GetAsync(url + pageId).Result;
                 JObject jsonObject = JObject.Parse(response.Content.ReadAsStringAsync().Result);
@@ -394,10 +534,8 @@ namespace Flow.Launcher.Plugin.Notion
 
         string GetPageIdByBlock(string BlockId)
         {
-            using (HttpClient client = new HttpClient())
+            using (HttpClient client = NotionApiClientFactory.Create(_settings))
             {
-                client.DefaultRequestHeaders.Add("Authorization", "Bearer " + _settings.InernalInegrationToken);
-                client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
                 string url = "https://api.notion.com/v1/blocks/";
                 var response = client.GetAsync(url + BlockId).Result;
 
@@ -465,11 +603,19 @@ namespace Flow.Launcher.Plugin.Notion
                                 CheckBox.Add(kvp.Key);
                                 continue;
                             }
-                            else if (values["type"].ToString().Contains("relation") &&
-                                // values["relation"]["database_id"].ToString() == _settings.RelationDatabaseId)
-                                _settings.RelationDatabasesIds.Contains(values["relation"]["database_id"].ToString()))
+                            else if (values["type"].ToString().Contains("relation"))
                             {
-                                Relation[kvp.Key.ToString()] = values["relation"]["database_id"].ToString();
+                                string? relationTargetId = null;
+                                if (values["relation"] is JObject relationObj)
+                                {
+                                    relationTargetId = ExtractRelationTargetId(relationObj);
+                                }
+
+                                if (!string.IsNullOrEmpty(relationTargetId) && _settings.RelationDatabasesIds.Contains(relationTargetId))
+                                {
+                                    Relation[kvp.Key.ToString()] = relationTargetId;
+                                }
+
                                 continue;
                             }
                             else if (values["type"].ToString().Contains("multi_select"))
@@ -530,10 +676,17 @@ namespace Flow.Launcher.Plugin.Notion
                         urlMap = urlMap,
                         status = Status,
                         check_box = CheckBox,
-                        url = DB["url"].ToString().Replace("https://", "notion://")
+                        url = DB["url"].ToString().Replace("https://", "notion://"),
+                        legacy_database_id = DB["database_parent"]?["database_id"]?.ToString()
                     }));
 
-                    Databases[GetFullTitle(DB["title"])] = jsonElement;
+                    string databaseName = GetFullTitle(DB["title"]);
+                    if (string.IsNullOrWhiteSpace(databaseName))
+                    {
+                        databaseName = DB["id"]?.ToString() ?? string.Empty;
+                    }
+
+                    Databases[databaseName] = jsonElement;
                     string jsonString = System.Text.Json.JsonSerializer.Serialize(Databases, new JsonSerializerOptions { WriteIndented = true });
                     File.WriteAllText(_settings.DatabaseCachePath, jsonString);
                 }
@@ -684,7 +837,7 @@ namespace Flow.Launcher.Plugin.Notion
         public async Task<Dictionary<string, JsonElement>> QueryDB(string DB, string filterPayload, string filePath = null, string itemSubtitle = "relation", List<string> propNames = null)
         {
             UpdateProjectsMap();
-            string url = $"https://api.notion.com/v1/databases/{DB}/query?";
+            string url = $"https://api.notion.com/v1/data_sources/{DB}/query";
             filterPayload = !string.IsNullOrEmpty(filterPayload) ? ConvertVariables(filterPayload) : filterPayload;
             Dictionary<string, object> _payload = new Dictionary<string, object>
             {
@@ -694,13 +847,8 @@ namespace Flow.Launcher.Plugin.Notion
             {
                 _payload.Add("filter", JsonConvert.DeserializeObject<dynamic>(filterPayload));
             }
-
-
-
-            using (HttpClient client = new HttpClient())
+            using (HttpClient client = NotionApiClientFactory.Create(_settings))
             {
-                client.DefaultRequestHeaders.Add("Authorization", "Bearer " + _settings.InernalInegrationToken);
-                client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
                 var jsonPayload = JsonConvert.SerializeObject(_payload);
                 var response = await client.PostAsync(url, new StringContent(jsonPayload, System.Text.Encoding.UTF8, "application/json"));
                 Dictionary<string, JsonElement> FilterResults = new Dictionary<string, JsonElement>();
@@ -894,10 +1042,8 @@ namespace Flow.Launcher.Plugin.Notion
         {
             try
             {
-                using (HttpClient client = new HttpClient())
+                using (HttpClient client = NotionApiClientFactory.Create(_settings))
                 {
-                    client.DefaultRequestHeaders.Add("Authorization", "Bearer " + _settings.InernalInegrationToken);
-                    client.DefaultRequestHeaders.Add("Notion-Version", "2022-06-28");
                     string url = "https://api.notion.com/v1/pages/";
                     var response = client.GetAsync(url + id).Result;
                     if (response.StatusCode == System.Net.HttpStatusCode.OK)
