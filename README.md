@@ -117,10 +117,10 @@
 - Restore and publish the plugin from the repo root:
 
   ```powershell
-  dotnet publish src/Flow.Launcher.Plugin.Notion.csproj -c Release
+  dotnet publish src/Flow.Launcher.Plugin.Notion.csproj -c Release -o publish
   ```
 
-- The packaged plugin resides in `src/bin/Release/net7.0-windows/publish/`. Copy those contents into your Flow Launcher plugin directory (for example `%APPDATA%\FlowLauncher\Plugins\Notion`) or attach the folder when creating a release.
+- The packaged plugin resides in the `publish/` folder generated in the repo root. Copy those contents into your Flow Launcher plugin directory (for example `%APPDATA%\FlowLauncher\Plugins\Notion`) or attach the folder when creating a release.
 
 ### Releasing
 
